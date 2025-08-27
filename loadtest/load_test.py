@@ -5,6 +5,7 @@ import uuid
 import argparse
 import json
 import math
+import random
 from typing import List, Dict, Optional
 import httpx
 import numpy as np
@@ -35,6 +36,12 @@ Environment Variables:
 
 DEFAULT_SIM_AGENT_LATENCY_MS = 420  # baseline synthetic mean
 DEFAULT_JITTER_MS = 120
+
+# Run-level variability knobs (to avoid identical aggregate stats across runs)
+RUN_ID = os.getenv("RUN_ID", uuid.uuid4().hex[:8])
+BASE_LATENCY_MS = int(os.getenv("BASE_LATENCY_MS", str(DEFAULT_SIM_AGENT_LATENCY_MS)))
+RUN_DRIFT_MS = int(os.getenv("RUN_DRIFT_MS", "30"))  # each caller adds a random offset in [-RUN_DRIFT_MS, +RUN_DRIFT_MS]
+JITTER_SCALE = float(os.getenv("JITTER_SCALE", "1.0"))  # scale jitter to further vary distribution
 
 ORCH_URL = os.getenv("ORCH_PUBLIC_URL", "http://localhost:8000")
 METRICS_ENDPOINT = os.getenv("METRICS_ENDPOINT", "http://localhost:9100/ingest")
@@ -76,8 +83,14 @@ async def simulate_caller(index: int,
                           post_metrics: bool,
                           metrics_prefix: str,
                           results: List[float],
+                          deterministic: bool,
                           seed: Optional[int] = None):
-    rng = np.random.default_rng(seed)
+    if deterministic:
+        rng = np.random.default_rng(seed if seed is not None else index)
+    else:
+        rng = np.random.default_rng()
+    # Per-caller drift so each run's aggregate metrics shift
+    caller_drift = random.randint(-RUN_DRIFT_MS, RUN_DRIFT_MS)
     async with httpx.AsyncClient(timeout=5.0) as client:
         try:
             token = await fetch_token(client, room, identity)
@@ -89,8 +102,8 @@ async def simulate_caller(index: int,
             speech_start = time.time()
             # Synthetic latency generation
             if synthetic:
-                base = DEFAULT_SIM_AGENT_LATENCY_MS
-                jitter = rng.normal(0, DEFAULT_JITTER_MS / 2)
+                base = BASE_LATENCY_MS + caller_drift
+                jitter = rng.normal(0, (DEFAULT_JITTER_MS * JITTER_SCALE) / 2)
                 latency_ms = max(120, base + jitter)
                 await asyncio.sleep(latency_ms / 1000.0)
             else:
@@ -117,7 +130,8 @@ async def run_load(concurrency: int,
                    shared_room: bool,
                    synthetic: bool,
                    post_metrics: bool,
-                   phrase: str):
+                   phrase: str,
+                   deterministic: bool):
     tasks = []
     results: List[float] = []
     room_base = ROOM_PREFIX + uuid.uuid4().hex[:6]
@@ -135,7 +149,8 @@ async def run_load(concurrency: int,
             post_metrics=post_metrics,
             metrics_prefix="synthetic_" if synthetic else "",
             results=results,
-            seed=i
+            deterministic=deterministic,
+            seed=i if deterministic else None
         ))
     await asyncio.gather(*tasks)
     elapsed = time.time() - start
@@ -158,17 +173,22 @@ def parse_args():
     ap.add_argument("--real", action="store_true", help="Attempt real (non-synthetic) latency mode (placeholder)")
     ap.add_argument("--no-metrics", action="store_true", help="Do not post synthetic metrics")
     ap.add_argument("--phrase", type=str, default=PHRASE, help="Phrase to simulate")
+    ap.add_argument("--deterministic", action="store_true", help="Deterministic seeded RNG (for reproducible runs)")
     return ap.parse_args()
 
 def main():
     args = parse_args()
+    print(f"[loadtest] RUN_ID={RUN_ID} base_latency={BASE_LATENCY_MS}ms drift=±{RUN_DRIFT_MS}ms "
+          f"jitter={DEFAULT_JITTER_MS}ms scale={JITTER_SCALE} synthetic={not args.real} "
+          f"concurrency={args.concurrency} bursts={args.bursts} shared_room={args.shared_room}")
     asyncio.run(run_load(
         concurrency=args.concurrency,
         bursts=args.bursts,
         shared_room=args.shared_room,
         synthetic=not args.real,
         post_metrics=not args.no_metrics,
-        phrase=args.phrase
+        phrase=args.phrase,
+        deterministic=args.deterministic
     ))
 
 if __name__ == "__main__":
