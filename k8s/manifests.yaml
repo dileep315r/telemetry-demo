@@ -1,0 +1,377 @@
+# Aggregate Kubernetes manifests for minimal deployment (apply selectively or split later)
+
+# 1. Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: telephony-demo
+---
+# 2. Secrets (replace stringData with real values or use external secret manager)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: livekit-secrets
+  namespace: telephony-demo
+type: Opaque
+stringData:
+  LIVEKIT_API_KEY: "REPLACE_ME_KEY"
+  LIVEKIT_API_SECRET: "REPLACE_ME_SECRET"
+  STT_API_KEY: "REPLACE_STT_KEY"
+  TTS_API_KEY: "REPLACE_TTS_KEY"
+---
+# 3. ConfigMap for LiveKit server config
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: livekit-config
+  namespace: telephony-demo
+data:
+  livekit.yaml: |
+$(sed 's/^/    /' config/livekit.yaml | sed 's/$(//g')
+---
+# 4. Redis (for session/state if horizontally scaling)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: telephony-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args: ["redis-server", "--appendonly", "no"]
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: telephony-demo
+spec:
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+# 5. LiveKit Deployment (single pod demo; StatefulSet recommended for prod)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: livekit
+  namespace: telephony-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: livekit
+  template:
+    metadata:
+      labels:
+        app: livekit
+    spec:
+      containers:
+        - name: livekit
+          image: livekit/livekit-server:latest
+          args: ["--config", "/config/livekit.yaml"]
+          env:
+            - name: LIVEKIT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: livekit-secrets
+                  key: LIVEKIT_API_KEY
+            - name: LIVEKIT_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: livekit-secrets
+                  key: LIVEKIT_API_SECRET
+            - name: LIVEKIT_REGION
+              value: "k8s"
+          volumeMounts:
+            - name: livekit-config
+              mountPath: /config
+          ports:
+            - containerPort: 7880 # signaling
+            - containerPort: 7881 # udp rtp (nodePort below optional)
+            - containerPort: 5060 # sip
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: livekit-config
+          configMap:
+            name: livekit-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: livekit
+  namespace: telephony-demo
+spec:
+  selector:
+    app: livekit
+  ports:
+    - name: signaling
+      port: 7880
+      targetPort: 7880
+    - name: rtp
+      port: 7881
+      targetPort: 7881
+    - name: sip
+      port: 5060
+      targetPort: 5060
+  type: ClusterIP
+---
+# Optional: external access (adjust for cloud LB)
+apiVersion: v1
+kind: Service
+metadata:
+  name: livekit-external
+  namespace: telephony-demo
+spec:
+  selector:
+    app: livekit
+  ports:
+    - name: signaling
+      port: 80
+      targetPort: 7880
+    - name: sip
+      port: 5060
+      targetPort: 5060
+  type: LoadBalancer
+---
+# 6. Orchestrator
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: telephony-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orchestrator
+  template:
+    metadata:
+      labels:
+        app: orchestrator
+    spec:
+      containers:
+        - name: orchestrator
+          image: telephony-demo/orchestrator:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: LIVEKIT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: livekit-secrets
+                  key: LIVEKIT_API_KEY
+            - name: LIVEKIT_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: livekit-secrets
+                  key: LIVEKIT_API_SECRET
+            - name: ORCH_JWT_TTL_SECONDS
+              value: "60"
+            - name: TWILIO_SIP_INGRESS_HOST
+              value: "replace-sip.example.com"
+            - name: LOG_LEVEL
+              value: "INFO"
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: telephony-demo
+spec:
+  selector:
+    app: orchestrator
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: ClusterIP
+---
+# 7. Metrics Collector
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics
+  namespace: telephony-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: metrics
+  template:
+    metadata:
+      labels:
+        app: metrics
+    spec:
+      containers:
+        - name: metrics
+          image: telephony-demo/metrics:latest
+          env:
+            - name: METRICS_SUMMARY_PORT
+              value: "9100"
+            - name: LATENCY_WINDOW_SECONDS
+              value: "60"
+          ports:
+            - containerPort: 9100
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metrics
+  namespace: telephony-demo
+spec:
+  selector:
+    app: metrics
+  ports:
+    - port: 9100
+      targetPort: 9100
+---
+# 8. Agent Deployment (horizontal scaling)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent
+  namespace: telephony-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: agent
+  template:
+    metadata:
+      labels:
+        app: agent
+    spec:
+      containers:
+        - name: agent
+          image: telephony-demo/agent:latest
+          env:
+            - name: LIVEKIT_HOST
+              value: "http://livekit.telephony-demo.svc.cluster.local:7880"
+            - name: LIVEKIT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: livekit-secrets
+                  key: LIVEKIT_API_KEY
+            - name: LIVEKIT_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: livekit-secrets
+                  key: LIVEKIT_API_SECRET
+            - name: METRICS_ENDPOINT
+              value: "http://metrics.telephony-demo.svc.cluster.local:9100/ingest"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: AGENT_RESPONSE_MODE
+              value: "echo"
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+# 9. Horizontal Pod Autoscaler for Agents (requires metrics server)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: agent-hpa
+  namespace: telephony-demo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: agent
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+---
+# 10. PodDisruptionBudget (prevent all agent pods draining)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: agent-pdb
+  namespace: telephony-demo
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: agent
+---
+# 11. NetworkPolicy example (restrict ingress to orchestrator & metrics)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-orchestrator
+  namespace: telephony-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: orchestrator
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8000
+  policyTypes:
+    - Ingress
+---
+# 12. NOTE:
+# - Replace telephony-demo/* image references with registry paths (e.g., ghcr.io/org/telephony-orchestrator:tag).
+# - Apply: kubectl apply -f k8s/manifests.yaml
+# - For production: add TLS ingress, persistent volumes (if needed), proper autoscaling signals (custom latency metric).

@@ -1,0 +1,65 @@
+# Minimal LiveKit configuration focused on low-latency audio + SIP ingress
+# Reference: https://docs.livekit.io
+
+keys:
+  api_key: ${LIVEKIT_API_KEY}
+  api_secret: ${LIVEKIT_API_SECRET}
+
+# Node identity & region (region used for room assignment when scaling horizontally)
+node_selector:
+  region: ${LIVEKIT_REGION:-local}
+
+# TURN / ICE (for public deployment you would configure TURN; omitted for local demo)
+# turn:
+#   enabled: true
+#   domain: turn.example.com
+#   tls_port: 5349
+
+ingress:
+  # Enable SIP ingress so Twilio can dial into rooms
+  sip:
+    # Bind address/ports (ensure UDP 5060 reachable if using public cloud)
+    port: 5060
+    udp: true
+    tcp: true
+    tls: false
+    # Optionally restrict codecs to Opus only for consistent pipeline
+    codecs:
+      audio:
+        - opus
+
+rtc:
+  # Lower packetization / buffering for reduced latency
+  playout_delay:
+    min: 20ms
+    max: 60ms
+  # Limit to audio-only to conserve resources for 100 concurrent calls
+  allow_transcoding: false
+  use_sfu: true
+
+# Room settings
+room:
+  empty_timeout: 60s          # Auto-close empty room after 60s
+  max_participants: 10         # PSTN call + agent + test clients (adjust as needed)
+
+# Logging
+logging:
+  level: info
+  json: true
+
+# Metrics (optional Prometheus exporter inside LiveKit)
+# metrics:
+#   prometheus_port: 6789
+
+# Redis configuration can be added when running multiple LiveKit nodes
+# redis:
+#   address: redis:6379
+#   db: 0
+
+# Webhook (optional) for room events -> orchestrator
+# webhooks:
+#   - url: ${ORCH_WEBHOOK_URL}
+
+# NOTE:
+# - For production, enable TURN, TLS SIP, and secure network ACLs.
+# - API keys are injected via environment variables in docker-compose.

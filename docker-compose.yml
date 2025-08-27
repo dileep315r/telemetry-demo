@@ -1,0 +1,95 @@
+version: "3.9"
+
+services:
+  livekit:
+    image: livekit/livekit-server:latest
+    container_name: livekit
+    command:
+      - --config
+      - /config/livekit.yaml
+    env_file:
+      - .env
+    volumes:
+      - ./config/livekit.yaml:/config/livekit.yaml:ro
+    ports:
+      - "7880:7880"        # LiveKit signaling (HTTP/WebSocket)
+      - "7881:7881/udp"    # LiveKit RTP/RTCP (adjust range if needed)
+      - "5060:5060/udp"    # SIP UDP
+      - "5060:5060/tcp"    # SIP TCP
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    command: ["redis-server", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    container_name: orchestrator
+    env_file:
+      - .env
+    environment:
+      - SERVICE_ROLE=orchestrator
+    depends_on:
+      - livekit
+      - redis
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    container_name: agent
+    env_file:
+      - .env
+    environment:
+      - SERVICE_ROLE=agent
+    depends_on:
+      - livekit
+      - orchestrator
+    deploy:
+      replicas: 1   # Scale via: docker compose up --scale agent=4
+    restart: unless-stopped
+
+  metrics:
+    build:
+      context: ./metrics
+      dockerfile: Dockerfile
+    container_name: metrics
+    env_file:
+      - .env
+    environment:
+      - SERVICE_ROLE=metrics
+    ports:
+      - "9100:9100"
+    restart: unless-stopped
+
+  loadtest:
+    build:
+      context: ./loadtest
+      dockerfile: Dockerfile
+    container_name: loadtest
+    env_file:
+      - .env
+    environment:
+      - SERVICE_ROLE=loadtest
+    depends_on:
+      - livekit
+      - orchestrator
+    command: ["sleep", "infinity"]  # Run ad-hoc: docker compose run --rm loadtest python load_test.py --concurrency 50
+
+networks:
+  default:
+    name: telephony-net
+
+# Notes:
+# - Provide Dockerfiles & code for orchestrator, agent, metrics, loadtest services.
+# - For production, pin images and enable healthchecks.
+# - Configure additional UDP port ranges if large scale beyond 100 calls (see LiveKit docs).
