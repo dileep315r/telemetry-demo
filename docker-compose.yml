@@ -83,7 +83,8 @@ services:
     depends_on:
       - livekit
       - orchestrator
-    command: ["sleep", "infinity"]  # Run ad-hoc: docker compose run --rm loadtest python load_test.py --concurrency 50
+    # Ad-hoc run example:
+    # docker compose run --rm loadtest --concurrency 50 --bursts 2 --shared-room
 
 networks:
   default:
