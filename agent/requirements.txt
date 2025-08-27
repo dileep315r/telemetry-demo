@@ -12,7 +12,6 @@ livekit==1.0.12
 # Audio processing (basic VAD & framing)
 webrtcvad==2.0.10
 numpy==1.26.4
-soundfile==0.12.1
 
 # STT / TTS client libs (choose providers; keep optional)
 # Deepgram (STT)

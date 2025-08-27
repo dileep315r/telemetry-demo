@@ -177,8 +177,8 @@ Proposed Enhancements (future):
 
 ## Load Test Approach
 
-- For speed in local/demo: run 100 simulated participants via `loadtest/load_test.py`.  
-- Options: `--concurrency 100 --burst-seconds 8 --phrase "test phrase"`  
+- For speed in local/demo: run 100 simulated participants via the loadtest container.  
+- Options: `--concurrency 100 --bursts 8 --phrase "test phrase"`  
 - Each client: join room, play wave/opus frames (pre-encoded) at real-time pace, record timestamps, await agent response start (first audio frame).  
 - Collect latencies -> metrics aggregator -> produce CSV + summary + optional matplotlib plot.  
 
@@ -225,7 +225,7 @@ on_final_transcript(text):
 1. `cp .env.example .env` fill keys.  
 2. `docker compose up --build`  
 3. (Optional) Configure Twilio & call number.  
-4. Run load test: `docker compose run --rm loadtest python load_test.py --concurrency 50` (repeat scaling to 100).  
+4. Run load test: `docker compose run --rm loadtest --concurrency 50 --bursts 2` (increase to 100 when stable).  
 5. View metrics: `curl localhost:9100/summary`  
 
 ## Roadmap (Next Implementation Steps)
@@ -250,6 +250,53 @@ on_final_transcript(text):
 - mTLS or ingress-level TLS termination.  
 - Rate limiting orchestrator endpoints.  
 - Observability: structured JSON logs; metrics exporter (Prometheus).  
+
+## Real STT/TTS Integration Plan
+
+1. STT (Deepgram example)  
+   - Switch `simulate_stt` to real websocket streaming.  
+   - Send 20 ms Opus (or decode to PCM if required) frames immediately as received.  
+   - Capture timestamps: first partial, first final segment.  
+   - Configure interim results enabled; stop sending audio on VAD end + 200 ms hangover.  
+2. TTS (ElevenLabs streaming)  
+   - Replace sine wave generator with streaming API.  
+   - Begin publishing on first received chunk (record TTSFirstByte timestamp).  
+   - Maintain async task handle to allow cancellation (barge-in).  
+3. Barge-In  
+   - On new VAD SpeechStart while TTS active: cancel TTS task, flush any buffered frames, transition state.  
+4. Configuration  
+   - Add env vars: `DEEPGRAM_API_KEY`, `ELEVEN_API_KEY`, `STT_LANGUAGE`, `TTS_VOICE_ID`.  
+5. Error Handling  
+   - Exponential backoff reconnect on transient 5xx / network errors (max 3 attempts).  
+6. Load / Scaling  
+   - One STT & TTS connection per active call (avoid multiplex until needed).  
+   - Benchmark per-call CPU; adjust worker pod call density target (start 25, refine).
+
+## Latency Instrumentation Verification Plan
+
+For each turn record JSON event with:  
+- speech_start_ms  
+- stt_partial_ms (first partial)  
+- agent_decision_ms  
+- tts_first_byte_ms  
+- playback_start_ms  
+- round_trip_ms (= playback_start - speech_start)  
+
+Verification Steps:  
+1. Unit simulate: inject synthetic delays to ensure math correctness.  
+2. Integration: enable real STT/TTS for 5 concurrent calls; compare synthetic vs real latencies.  
+3. Consistency check: Ensure monotonic ordering (speech_start <= partial <= decision <= tts_first_byte <= playback_start).  
+4. p95 SLA gate: Alert if rolling 5‑min p95 > 600 ms.  
+5. Cross-check: Load test client optional ear-level measurement (arrival timestamp) to estimate network playout delta.  
+
+Data Storage:  
+- In-memory ring buffer (last 10k events) + optional CSV append (rotate daily).  
+- Expose /events (recent N) & /summary (aggregates).  
+
+Next Optimization Targets:  
+- Reduce STT first partial by lowering frame size or enabling low-latency model tier.  
+- Optimize TTS by pre-warming voices (warm-up request at worker start).  
+- Tune LiveKit playout/jitter params further once real media path active.
 
 ## License
 
