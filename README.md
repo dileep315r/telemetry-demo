@@ -84,15 +84,12 @@ Pipeline overlaps STT with capture; TTS starts while remainder of transcript may
 - Maintain current TTS task handle; when VAD SpeechStart detected and state == Speaking, cancel TTS stream and stop publishing track mid-buffer.  
 - Optionally play short chime to indicate interruption (disabled for latency).  
 
-## Repository Structure (planned)
+## Repository Structure
 
 ```
 config/livekit.yaml
 orchestrator/app.py
 agent/worker.py
-agent/pipeline/stt.py
-agent/pipeline/tts.py
-agent/pipeline/vad.py
 metrics/latency_collector.py
 loadtest/load_test.py
 scripts/generate_tokens.py
@@ -100,7 +97,7 @@ docker-compose.yml
 k8s/ (optional manifests)
 .env.example
 README.md
-architecture.md (if needed for extended notes)
+architecture.md
 ```
 
 ## Environment Variables (.env.example will contain)
@@ -116,7 +113,7 @@ architecture.md (if needed for extended notes)
 - METRICS_ENDPOINT=http://metrics:9100/ingest
 - LOG_LEVEL=INFO
 
-## Docker Compose (planned services)
+## Docker Compose
 
 - livekit (official image)  
 - orchestrator (FastAPI + uvicorn)  
@@ -206,19 +203,105 @@ Graph generation script (optional) will produce PNG.
 - redis (bitnami/redis)  
 - ConfigMaps for livekit.yaml  
 - Secrets for API keys  
-- PodDisruptionBudgets for livekit & agent  
+- PodDisruptionBudgets for livekit & agent
 
-## Minimal Agent Logic
+## GCP Deployment (GKE Quick Guide)
 
-Pseudo:
-```python
-on_partial_transcript(text):
-    if first_partial and not responding:
-        # Wait small debounce or trigger immediate
-on_final_transcript(text):
-    reply = f"You said: {text}. Nice!"
-    start_tts_stream(reply)
+Steps (replace YOUR_PROJECT_ID / region):
+1. Enable APIs  
 ```
+gcloud config set project YOUR_PROJECT_ID
+gcloud services enable container.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com
+```
+2. Artifact Registry  
+```
+gcloud artifacts repositories create telephony-repo \
+  --repository-format=docker --location=us-central1
+export AR=us-central1-docker.pkg.dev/YOUR_PROJECT_ID/telephony-repo
+```
+3. Build & Push Images  
+```
+for svc in orchestrator agent metrics loadtest; do
+  docker build -t $AR/$svc:v1 ./$svc
+  docker push $AR/$svc:v1
+done
+docker pull livekit/livekit-server:latest
+docker tag livekit/livekit-server:latest $AR/livekit-server:latest
+docker push $AR/livekit-server:latest
+```
+4. Create GKE Cluster  
+```
+gcloud container clusters create telephony-cluster \
+  --zone us-central1-a --num-nodes=3 --machine-type=e2-standard-4 \
+  --enable-autoscaling --min-nodes=3 --max-nodes=10
+gcloud container clusters get-credentials telephony-cluster --zone us-central1-a
+```
+5. Secrets  
+```
+kubectl create namespace telephony-demo-k8s
+kubectl create secret generic livekit-secrets \
+  --from-literal=LIVEKIT_API_KEY=XXX \
+  --from-literal=LIVEKIT_API_SECRET=YYY \
+  --from-literal=STT_API_KEY=ZZZ \
+  --from-literal=TTS_API_KEY=QQQ \
+  -n telephony-demo-k8s
+```
+6. Manifests Adjustments  
+- Replace telephony-demo/* images with $AR/<svc>:v1  
+- Optionally set livekit-signal Service type: LoadBalancer  
+- (Optional) Add Ingress for orchestrator + signaling (HTTP 7880)
+
+7. Apply  
+```
+kubectl apply -f k8s/manifests.yaml
+kubectl -n telephony-demo-k8s get pods
+```
+
+8. Ingress (example)  
+```
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: telephony-ingress
+  namespace: telephony-demo-k8s
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+spec:
+  rules:
+  - host: YOUR_DOMAIN
+    http:
+      paths:
+      - path: /token
+        pathType: Prefix
+        backend: {service: {name: orchestrator, port: {number: 8000}}}
+```
+
+9. Load Test on GKE  
+```
+kubectl -n telephony-demo-k8s create job --from=job/loadtest-100 loadtest-100-run
+kubectl -n telephony-demo-k8s logs -f job/loadtest-100-run
+```
+
+10. Metrics Access  
+```
+kubectl -n telephony-demo-k8s port-forward svc/metrics 9100:9100
+curl -s http://localhost:9100/summary
+```
+
+11. Twilio SIP  
+- Reserve static IP (LB) for livekit-signal SIP (UDP/TCP 5060 + RTP range)  
+- Point Twilio SIP Domain/TwiML to Orchestrator webhook + SIP `<Dial>` with token
+
+12. Scaling & Tuning  
+- `kubectl scale deploy/agent --replicas=4` (or rely on HPA)  
+- Increase nodes or switch to larger machine types for >100 calls  
+- Monitor p95 from metrics service; if >600 ms scale agents or add LiveKit node
+
+Security / Production Enhancements:
+- Pin image digests, enable TLS (ManagedCertificate), NetworkPolicies restricting Redis & metrics, Workload Identity for secret access, Prometheus for latency-based autoscaling.
+
+Cost Notes:
+- Minimal 3x e2-standard-4 suits 100 audio-only calls w/ headroom; scale down off-peak using cluster autoscaler.
 
 ## Quick Start (Docker Compose)
 
@@ -403,22 +486,3 @@ Runtime Tuning Levers:
 - Pre-warm TTS voice (send 1 token request at startup) to reduce cold-start by 40–80 ms.
 - Use STT low-latency model tier (trade small accuracy).
 - Monitor `/summary` p95 drift; scale agent pods when CPU >70% sustained.
-
-Validation Procedure for Submission:
-1. Start stack (Compose or K8s).
-2. Run load (100 callers).
-3. Capture `curl /summary` every 5s for 60s window.
-4. Export detailed events to CSV: `python scripts/latency_report.py --metrics-url http://localhost:9100 --csv out.csv`.
-5. Confirm p95 <600 ms, monotonic timestamps per turn, no agent backlog (queue length 0—implicit since synthetic).
-
-Future Real-World Enhancements:
-- Client ear timestamp capture (load test client subscribes & records first packet arrival).
-- Export Prometheus histogram for round_trip_ms.
-- Adaptive dynamic frame sizing (switch 20→10 ms under rising latency).
-- Partial-driven speculative TTS (start with partial, refine with final via continuation / append).
-
-## License
-
-MIT (add LICENSE if required).
-
----
