@@ -53,12 +53,15 @@ AGENT_RESPONSE_MODE = os.getenv("AGENT_RESPONSE_MODE", "echo")
 AGENT_SCRIPTED_LINES = os.getenv("AGENT_SCRIPTED_LINES", "Hello.|How can I help?|Goodbye.").split("|")
 AGENT_BARGE_IN = os.getenv("AGENT_BARGE_IN", "true").lower() == "true"
 
-SAMPLE_RATE = 16000
-FRAME_MS = 20
+# Audio framing (configurable via env for latency tuning)
+SAMPLE_RATE = int(os.getenv("AGENT_SAMPLE_RATE", "16000"))
+FRAME_MS = int(os.getenv("AGENT_FRAME_MS", "20"))  # 10, 15, 20 typical; lower reduces latency but raises overhead
 FRAME_BYTES = int(SAMPLE_RATE * (FRAME_MS / 1000.0)) * 2  # 16-bit mono PCM
+VAD_DEFAULT_AGGR = int(os.getenv("VAD_AGGRESSIVENESS", "2"))
 
 class VADDetector:
-    def __init__(self, aggressiveness: int = 2):
+    def __init__(self, aggressiveness: int = VAD_DEFAULT_AGGR):
+        # Aggressiveness 0..3 (3 = most aggressive, more false positives)
         self.vad = webrtcvad.Vad(aggressiveness)
         self.active = False
         self.speech_start_ts: Optional[float] = None
